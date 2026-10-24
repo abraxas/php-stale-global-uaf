@@ -1,0 +1,2 @@
+php_flag auto_detect_line_endings on
+php_flag report_memleaks off
