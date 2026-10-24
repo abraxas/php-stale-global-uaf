@@ -2,7 +2,7 @@
   <img src="header.png" alt="Abraxas Labs - php-stale-global-uaf" width="100%">
 </p>
 
-# php-stale-global-uaf
+# php2shell/php2dos - php-stale-global-uaf
 
 Someone on the internet can talk to your PHP site the same way a browser does, with no password. On last-affected PHP 8.5 they can force one request to die with a fatal error, then send a second request to the same worker. PHP 8.5 keeps a backtrace from that fatal in worker-global memory after the request heap is gone. The second request reads it while applying a leftover INI flag, before the engine has reset itself. In this lab that second request kills the Apache child. The PHP Group showed the same pattern can become remote code execution as the web worker.
 
